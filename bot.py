@@ -1,62 +1,82 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import Message
-from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
+from aiogram.types import Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
-import os
+from dotenv import load_dotenv
 
-TOKEN = "7743030157:AAHUdBAbjgADXfpfFIjTXsS6OSzIbWX-5Rk"
-ADMIN_ID = 1946338633  # Твой Telegram ID
-WEBHOOK_URL = "https://your-app.onrender.com/webhook"
-WEBHOOK_PATH = "/webhook"
+# Загрузка переменных окружения
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # URL для вебхука
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", 8080))
 
-bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-user_messages = {}  # Сохраняем сообщения, чтобы можно было отвечать
+
+# Хранилище персональных ссылок
+user_links = {}
 
 @dp.message(CommandStart())
-async def start_command(message: Message):
-    await message.answer("Отправь мне анонимное сообщение, и его получит админ.")
+async def start(message: Message):
+    user_id = message.from_user.id
+    user_links[user_id] = f"https://t.me/{bot.username}?start={user_id}"
+    await message.answer(f"Привет! Вот твоя персональная ссылка: {user_links[user_id]}\n" 
+                         "Люди могут писать тебе анонимно, а ты можешь отвечать им.")
 
 @dp.message()
-async def anonymous_message(message: Message):
-    user_messages[message.message_id] = message.from_user.id
-    forward_text = f"📩 Новое анонимное сообщение:\n{message.text}"
-    reply_markup = types.InlineKeyboardMarkup()
-    reply_markup.add(types.InlineKeyboardButton("Ответить", callback_data=f"reply_{message.message_id}"))
-    await bot.send_message(ADMIN_ID, forward_text, reply_markup=reply_markup)
-    await message.answer("✅ Сообщение отправлено анонимно.")
+async def receive_anonymous_message(message: Message):
+    if message.text and message.text.startswith("/start"):
+        return  # Пропускаем обработку команды /start
+    
+    sender_id = message.from_user.id
+    target_id = None
+    
+    if sender_id in user_links:
+        target_id = sender_id
+    
+    if target_id:
+        forward_text = f"💌 Анонимное сообщение для {target_id}:
 
-@dp.callback_query(lambda c: c.data.startswith("reply_"))
-async def reply_callback(callback: types.CallbackQuery):
-    msg_id = int(callback.data.split("_")[1])
-    await bot.send_message(ADMIN_ID, "✍️ Напишите ответ на это сообщение:")
-    dp.message.register(reply_handler, state=msg_id)
-
-async def reply_handler(message: Message, state):
-    user_id = user_messages.get(state)
-    if user_id:
-        await bot.send_message(user_id, f"📩 Ответ от админа:\n{message.text}")
-        await message.answer("✅ Ответ отправлен.")
+{message.text or '[медиа]'}"
+        await bot.send_message(target_id, forward_text)
+        await bot.send_message(ADMIN_ID, f"👀 {message.from_user.full_name} (@{message.from_user.username}) написал: {message.text}")
     else:
-        await message.answer("❌ Ошибка: не найдено оригинальное сообщение.")
-    dp.message.unregister(state)
+        await message.answer("❌ Ошибка: получатель не найден.")
+
+@dp.callback_query()
+async def reply_to_anonymous(callback: types.CallbackQuery):
+    target_id = callback.data.split(':')[1]
+    await bot.send_message(target_id, f"✉️ Ответ на ваше сообщение: {callback.message.text}")
+    await bot.send_message(ADMIN_ID, f"✅ Ответ отправлен пользователю {target_id}.")
 
 async def on_startup():
-    await bot.set_webhook(WEBHOOK_URL)
+    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 async def on_shutdown():
     await bot.delete_webhook()
-    await bot.session.close()
 
-app = web.Application()
-SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-setup_application(app, dp, bot=bot)
-app.on_startup.append(lambda _: on_startup())
-app.on_shutdown.append(lambda _: on_shutdown())
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    app = web.Application()
+    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, on_startup=on_startup, on_shutdown=on_shutdown)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    asyncio.run(main())
